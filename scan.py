@@ -220,17 +220,66 @@ class CanonLiDE300:
         self.dev = usb.core.find(idVendor=CANON_VID, idProduct=LIDE300_PID)
         if self.dev is None:
             print("ERROR: scanner not found.\n"
-                  "  • Is it plugged in and powered on?\n"
-                  "  • On Windows run Zadig to install the WinUSB driver.")
+                  "  * Is it plugged in and powered on?\n"
+                  "  * On Windows run Zadig to install the WinUSB driver.\n"
+                  "  * On Linux run with sudo or set up udev rules.")
             return False
         try:
+            # Print USB device info for diagnostics
+            print(f"  Found: bus {self.dev.bus} addr {self.dev.address}")
+
+            # Detach kernel driver from ALL interfaces (Linux: usblp, ippusbxd)
+            cfg = self.dev.get_active_configuration()
+            if cfg is None:
+                self.dev.set_configuration()
+                cfg = self.dev.get_active_configuration()
+            for intf in cfg:
+                ifnum = intf.bInterfaceNumber
+                try:
+                    if self.dev.is_kernel_driver_active(ifnum):
+                        print(f"  Detaching kernel driver from interface {ifnum}")
+                        self.dev.detach_kernel_driver(ifnum)
+                except (usb.core.USBError, NotImplementedError):
+                    pass
+
+            # Reset device to clear stale state
             try:
-                if self.dev.is_kernel_driver_active(0):
-                    self.dev.detach_kernel_driver(0)
-            except (usb.core.USBError, NotImplementedError):
-                pass
+                self.dev.reset()
+                time.sleep(0.5)
+                # Re-find after reset
+                self.dev = usb.core.find(idVendor=CANON_VID, idProduct=LIDE300_PID)
+                if self.dev is None:
+                    print("ERROR: device lost after reset")
+                    return False
+                # Detach again after reset
+                cfg = self.dev.get_active_configuration()
+                if cfg is None:
+                    self.dev.set_configuration()
+                    cfg = self.dev.get_active_configuration()
+                for intf in cfg:
+                    ifnum = intf.bInterfaceNumber
+                    try:
+                        if self.dev.is_kernel_driver_active(ifnum):
+                            self.dev.detach_kernel_driver(ifnum)
+                    except (usb.core.USBError, NotImplementedError):
+                        pass
+            except usb.core.USBError as e:
+                print(f"  Reset skipped: {e}")
+
             self.dev.set_configuration()
             cfg = self.dev.get_active_configuration()
+
+            # Print all interfaces and endpoints for diagnostics
+            for intf in cfg:
+                print(f"  Interface {intf.bInterfaceNumber} "
+                      f"alt={intf.bAlternateSetting} "
+                      f"class=0x{intf.bInterfaceClass:02X}")
+                for ep in intf:
+                    d = "IN" if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_IN else "OUT"
+                    t = {0: "CTRL", 1: "ISO", 2: "BULK", 3: "INTR"}[usb.util.endpoint_type(ep.bmAttributes)]
+                    print(f"    EP 0x{ep.bEndpointAddress:02X} {d} {t} "
+                          f"maxpkt={ep.wMaxPacketSize}")
+
             intf = cfg[(0, 0)]
             self.ep_out = usb.util.find_descriptor(
                 intf, custom_match=lambda e:
@@ -245,11 +294,42 @@ class CanonLiDE300:
                     usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN
                     and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_INTR)
             if not self.ep_out or not self.ep_in:
-                print("ERROR: required bulk endpoints not found.")
+                print("ERROR: required bulk endpoints not found on interface 0.")
+                # Try other interfaces
+                for intf2 in cfg:
+                    if intf2.bInterfaceNumber == 0:
+                        continue
+                    ep_o = usb.util.find_descriptor(
+                        intf2, custom_match=lambda e:
+                            usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
+                            and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK)
+                    ep_i = usb.util.find_descriptor(
+                        intf2, custom_match=lambda e:
+                            usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN
+                            and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK)
+                    if ep_o and ep_i:
+                        print(f"  -> Using interface {intf2.bInterfaceNumber} instead")
+                        self.ep_out = ep_o
+                        self.ep_in = ep_i
+                        break
+            if not self.ep_out or not self.ep_in:
+                print("ERROR: no usable bulk endpoints found on any interface.")
                 return False
+
+            # Explicitly claim the interface
+            try:
+                usb.util.claim_interface(self.dev, self.ep_out.interface_number
+                                         if hasattr(self.ep_out, 'interface_number') else 0)
+            except usb.core.USBError:
+                pass
+
             self.connected = True
             print(f"  Connected.  OUT=0x{self.ep_out.bEndpointAddress:02X}  "
                   f"IN=0x{self.ep_in.bEndpointAddress:02X}")
+
+            # Flush stale bulk data
+            self._flush_bulk()
+
             return True
         except usb.core.USBError as e:
             print(f"USB error during connect: {e}")
@@ -271,6 +351,14 @@ class CanonLiDE300:
     def _read(self, size, timeout=BULK_TIMEOUT):
         return bytes(self.ep_in.read(size, timeout=timeout))
 
+    def _flush_bulk(self):
+        """Drain any stale data sitting in the bulk-IN pipe."""
+        for _ in range(8):
+            try:
+                self.ep_in.read(512, timeout=100)
+            except usb.core.USBError:
+                break
+
     def _clear_interrupts(self):
         if not self.ep_int:
             return
@@ -282,19 +370,46 @@ class CanonLiDE300:
 
     # ── XML dialog layer ───────────────────────────────────────────────
     def _xml_dialog(self, xml_str):
-        """Send an XML request, read XML response, return True if OK."""
+        """Send an XML request, read XML response, return True if OK.
+        Uses SANE-style retry (1s timeout × 8 retries).
+        Returns (ok, response_detail) tuple."""
         payload = xml_str.encode('utf-8')
-        self._write(payload, timeout=XML_TIMEOUT)
-        resp = self._read(4096, timeout=XML_TIMEOUT)
-        resp_text = resp.decode('utf-8', errors='replace')
-        ok = bool(_XML_OK_RE.search(resp_text))
-        tag = "OK" if ok else "FAIL"
         op = _re.search(r'<ivec:operation>(\w+)</ivec:operation>', xml_str)
         op_name = op.group(1) if op else xml_str[:60]
-        print(f"  XML {op_name}: {tag}")
+
+        self._write(payload, timeout=XML_TIMEOUT)
+
+        # Read response with retry (like pixma_cmd_transaction: rec_tmo=8)
+        resp = None
+        for attempt in range(8):
+            try:
+                resp = self._read(4096, timeout=1500)
+                break
+            except usb.core.USBError as e:
+                is_timeout = 'timeout' in str(e).lower() or getattr(e, 'errno', 0) in (110, -116)
+                if is_timeout:
+                    print(f"  XML {op_name}: no response yet (retry {attempt+1}/8)")
+                    continue
+                raise
+
+        if resp is None:
+            print(f"  XML {op_name}: TIMEOUT (no response after 8 retries)")
+            return False, "Timeout"
+
+        resp_text = resp.decode('utf-8', errors='replace')
+        ok = bool(_XML_OK_RE.search(resp_text))
+
+        # Extract response_detail if present
+        detail_m = _re.search(
+            r'<ivec:response_detail[^>]*>\s*(.*?)\s*</ivec:response_detail>',
+            resp_text, _re.DOTALL)
+        detail = detail_m.group(1).strip() if detail_m else ""
+
+        tag = "OK" if ok else "FAIL"
+        print(f"  XML {op_name}: {tag}" + (f"  ({detail})" if detail else ""))
         if not ok:
             print(f"       response ({len(resp_text)} chars):\n{resp_text}")
-        return ok
+        return ok, detail
 
     # ── binary command helpers ─────────────────────────────────────────
     def _exec(self, cmd_code, dataout=None, datain_len=0, timeout=BULK_TIMEOUT):
@@ -505,13 +620,26 @@ class CanonLiDE300:
         print(f"{'─'*60}\n")
 
         try:
-            # Phase 1 – XML handshake
+            # Phase 1 – XML handshake (retry if scanner is still initializing)
             print("[1/10] XML StartJob ...")
-            if not self._xml_dialog(XML_START_1):
-                raise IOError("XML StartJob rejected")
+            _RETRY_DETAILS = {'poweroninitializing', 'devicebusy', 'busy'}
+            for xml_attempt in range(30):
+                ok, detail = self._xml_dialog(XML_START_1)
+                if ok:
+                    break
+                if detail.lower() in _RETRY_DETAILS:
+                    print(f"  Scanner not ready ({detail}), "
+                          f"waiting 2s ... ({xml_attempt+1}/30)")
+                    time.sleep(2)
+                else:
+                    raise IOError(f"XML StartJob rejected: {detail}")
+            else:
+                raise IOError("Scanner did not become ready after 60s")
+
             print("[2/10] XML VendorCmd ModeShift ...")
-            if not self._xml_dialog(XML_START_2):
-                raise IOError("XML ModeShift rejected")
+            ok, detail = self._xml_dialog(XML_START_2)
+            if not ok:
+                raise IOError(f"XML ModeShift rejected: {detail}")
 
             # Phase 2 – clear pending interrupts
             print("[3/10] Clearing interrupts ...")

@@ -2,231 +2,758 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>LiDE300 WebUSB 50DPI Test</title>
+<title>Canon LiDE 300 WebUSB Scanner</title>
 <style>
-body { font-family: sans-serif; }
-button { margin: 5px; padding: 8px; }
-canvas { border: 1px solid #999; margin-top: 10px; }
-#log { white-space: pre-wrap; font-size: 12px; background:#f5f5f5; padding:10px; height:200px; overflow:auto;}
+body { font-family: sans-serif; max-width: 900px; margin: 20px auto; padding: 0 20px; }
+button { margin: 5px; padding: 10px 16px; cursor: pointer; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+canvas { border: 1px solid #999; margin-top: 10px; max-width: 100%; }
+#log { white-space: pre-wrap; font-size: 12px; background:#f5f5f5; padding:10px; height:250px; overflow:auto; border:1px solid #ddd; }
+.controls { margin: 10px 0; }
+select, input { padding: 5px; margin: 5px; }
+label { margin-right: 10px; }
+.status { padding: 10px; margin: 10px 0; border-radius: 4px; }
+.status.connected { background: #d4edda; color: #155724; }
+.status.disconnected { background: #f8d7da; color: #721c24; }
 </style>
 </head>
 <body>
 
-<h2>Canon LiDE300 WebUSB 50 DPI Test</h2>
+<h2>Canon LiDE 300 WebUSB Scanner</h2>
 
-<button onclick="connect()">Connect</button>
-<button onclick="scan()">Scan (≈50 DPI)</button>
-<button onclick="disconnect()">Disconnect</button>
+<div id="statusBar" class="status disconnected">Disconnected</div>
 
-<br>
+<div class="controls">
+    <button id="btnConnect" onclick="connect()">Connect Scanner</button>
+    <button id="btnScan" onclick="scan()" disabled>Start Scan</button>
+    <button id="btnDisconnect" onclick="disconnect()" disabled>Disconnect</button>
+</div>
+
+<div class="controls">
+    <label>DPI:
+        <select id="dpiSelect">
+            <option value="75">75 DPI (Fast)</option>
+            <option value="150">150 DPI</option>
+            <option value="300" selected>300 DPI (Default)</option>
+            <option value="600">600 DPI</option>
+        </select>
+    </label>
+    <label>Mode:
+        <select id="modeSelect">
+            <option value="color" selected>Color (24-bit)</option>
+            <option value="gray">Grayscale (8-bit)</option>
+        </select>
+    </label>
+</div>
+
 <canvas id="preview"></canvas>
 
 <h3>Log</h3>
 <div id="log"></div>
 
 <script>
-const VID = 0x04A9;
-const PID = 0x1913;
+// ═══════════════════════════════════════════════════════════════════════════
+//  Constants (matching scan.py)
+// ═══════════════════════════════════════════════════════════════════════════
+const CANON_VID = 0x04A9;
+const LIDE300_PID = 0x1913;
 
-let EP_OUT;
-let EP_IN;
-let IFACE_NUMBER;
+// Binary protocol commands
+const CMD_START_SESSION = 0xDB20;
+const CMD_ABORT_SESSION = 0xEF20;
+const CMD_GAMMA = 0xEE20;
+const CMD_SCAN_PARAM_3 = 0xD820;
+const CMD_SCAN_START_3 = 0xD920;
+const CMD_STATUS_3 = 0xDA20;
+const CMD_READ_IMAGE = 0xD420;
 
+// Response status codes
+const STATUS_OK = 0x0606;
+const STATUS_BUSY = 0x1414;
+const STATUS_FAILED = 0x1515;
+
+// Protocol constants
+const CMD_HEADER_LEN = 16;
+const RES_HEADER_LEN = 8;
+const IMAGE_BLOCK_SIZE = 512 * 1024;
+
+// LiDE 300 specs
+const LIDE300_MIN_XDPI = 300;
+const LIDE300_WIDTH_75DPI = 638;
+const LIDE300_HEIGHT_75DPI = 877;
+
+// XML Dialog Messages
+const XML_START_1 = 
+    '<?xml version="1.0" encoding="utf-8" ?>' +
+    '<cmd xmlns:ivec="http://www.canon.com/ns/cmd/2008/07/common/">' +
+    '<ivec:contents><ivec:operation>StartJob</ivec:operation>' +
+    '<ivec:param_set servicetype="scan">' +
+    '<ivec:jobID>00000001</ivec:jobID>' +
+    '<ivec:bidi>1</ivec:bidi>' +
+    '</ivec:param_set></ivec:contents></cmd>';
+
+const XML_START_2 = 
+    '<?xml version="1.0" encoding="utf-8" ?>' +
+    '<cmd xmlns:ivec="http://www.canon.com/ns/cmd/2008/07/common/"' +
+    ' xmlns:vcn="http://www.canon.com/ns/cmd/2008/07/canon/">' +
+    '<ivec:contents><ivec:operation>VendorCmd</ivec:operation>' +
+    '<ivec:param_set servicetype="scan">' +
+    '<ivec:jobID>00000001</ivec:jobID>' +
+    '<vcn:ijoperation>ModeShift</vcn:ijoperation>' +
+    '<vcn:ijmode>1</vcn:ijmode>' +
+    '</ivec:param_set></ivec:contents></cmd>';
+
+const XML_END = 
+    '<?xml version="1.0" encoding="utf-8" ?>' +
+    '<cmd xmlns:ivec="http://www.canon.com/ns/cmd/2008/07/common/">' +
+    '<ivec:contents><ivec:operation>EndJob</ivec:operation>' +
+    '<ivec:param_set servicetype="scan">' +
+    '<ivec:jobID>00000001</ivec:jobID>' +
+    '</ivec:param_set></ivec:contents></cmd>';
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Global state
+// ═══════════════════════════════════════════════════════════════════════════
 let device = null;
+let EP_OUT = null;
+let EP_IN = null;
+let IFACE_NUMBER = null;
+let currentStatus = new Uint8Array(16);
+let lastBlock = 0;
 
-function log(msg){
+// ═══════════════════════════════════════════════════════════════════════════
+//  Utility functions
+// ═══════════════════════════════════════════════════════════════════════════
+function log(msg) {
+    const timestamp = new Date().toLocaleTimeString();
+    const logDiv = document.getElementById("log");
+    logDiv.textContent += `[${timestamp}] ${msg}\n`;
+    logDiv.scrollTop = logDiv.scrollHeight;
     console.log(msg);
-    document.getElementById("log").textContent += msg + "\n";
 }
 
+function updateStatus(connected) {
+    const statusBar = document.getElementById("statusBar");
+    const btnConnect = document.getElementById("btnConnect");
+    const btnScan = document.getElementById("btnScan");
+    const btnDisconnect = document.getElementById("btnDisconnect");
+    
+    if (connected) {
+        statusBar.className = "status connected";
+        statusBar.textContent = "Connected to Canon LiDE 300";
+        btnConnect.disabled = true;
+        btnScan.disabled = false;
+        btnDisconnect.disabled = false;
+    } else {
+        statusBar.className = "status disconnected";
+        statusBar.textContent = "Disconnected";
+        btnConnect.disabled = false;
+        btnScan.disabled = true;
+        btnDisconnect.disabled = true;
+    }
+}
 
+function alignUp(x, n) {
+    return Math.ceil(x / n) * n;
+}
 
-async function connect(){
+function makeChecksum(data) {
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) {
+        sum += data[i];
+    }
+    return (-sum) & 0xFF;
+}
 
-    device = await navigator.usb.requestDevice({
-        filters: [{vendorId: 0x04A9, productId: 0x1913}]
-    });
+function buildGammaTable(gamma = 1.0, n = 1024) {
+    const tbl = new Uint8Array(n * 2);
+    const r = 1.0 / gamma;
+    const scIn = 1.0 / (n - 1);
+    
+    for (let i = 0; i < n; i++) {
+        let v = Math.round(65535.0 * Math.pow(i * scIn, r));
+        v = Math.min(v, 65535);
+        tbl[2 * i] = v & 0xFF;
+        tbl[2 * i + 1] = (v >> 8) & 0xFF;
+    }
+    return tbl;
+}
 
-    await device.open();
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-    if (device.configuration === null)
-        await device.selectConfiguration(1);
+// ═══════════════════════════════════════════════════════════════════════════
+//  USB Connection
+// ═══════════════════════════════════════════════════════════════════════════
+async function connect() {
+    try {
+        log("Requesting USB device...");
+        
+        device = await navigator.usb.requestDevice({
+            filters: [{ vendorId: CANON_VID, productId: LIDE300_PID }]
+        });
 
-    // 🔎 查找包含 bulk IN + bulk OUT 的 interface
-    for (const iface of device.configuration.interfaces) {
+        await device.open();
+        log(`Device opened: ${device.productName || 'Canon LiDE 300'}`);
 
-        for (const alt of iface.alternates) {
+        if (device.configuration === null) {
+            await device.selectConfiguration(1);
+        }
 
-            let bulkIn = null;
-            let bulkOut = null;
+        // Find interface with bulk IN + bulk OUT endpoints
+        for (const iface of device.configuration.interfaces) {
+            for (const alt of iface.alternates) {
+                let bulkIn = null;
+                let bulkOut = null;
 
-            for (const ep of alt.endpoints) {
-                if (ep.type === "bulk") {
-                    if (ep.direction === "in")  bulkIn = ep.endpointNumber;
-                    if (ep.direction === "out") bulkOut = ep.endpointNumber;
+                for (const ep of alt.endpoints) {
+                    if (ep.type === "bulk") {
+                        if (ep.direction === "in") bulkIn = ep.endpointNumber;
+                        if (ep.direction === "out") bulkOut = ep.endpointNumber;
+                    }
+                }
+
+                if (bulkIn !== null && bulkOut !== null) {
+                    IFACE_NUMBER = iface.interfaceNumber;
+                    await device.claimInterface(IFACE_NUMBER);
+                    
+                    if (alt.alternateSetting !== 0) {
+                        await device.selectAlternateInterface(IFACE_NUMBER, alt.alternateSetting);
+                    }
+
+                    EP_IN = bulkIn;
+                    EP_OUT = bulkOut;
+
+                    log(`Interface: ${IFACE_NUMBER}, Bulk IN: ${EP_IN}, Bulk OUT: ${EP_OUT}`);
+                    updateStatus(true);
+                    
+                    // Flush any stale data
+                    await flushBulk();
+                    
+                    return;
                 }
             }
-
-            if (bulkIn !== null && bulkOut !== null) {
-
-                IFACE_NUMBER = iface.interfaceNumber;
-
-                await device.claimInterface(IFACE_NUMBER);
-                await device.selectAlternateInterface(IFACE_NUMBER, alt.alternateSetting);
-
-                EP_IN  = bulkIn;
-                EP_OUT = bulkOut;
-
-                log("Using interface: " + IFACE_NUMBER);
-                log("Bulk IN: " + EP_IN);
-                log("Bulk OUT: " + EP_OUT);
-
-                return;
-            }
         }
+
+        throw new Error("No bulk interface found!");
+    } catch (e) {
+        log(`Connection error: ${e.message}`);
+        device = null;
+        updateStatus(false);
     }
-
-    throw "No bulk interface found!";
 }
 
-function buildCmd(cmd, outLen=0, inLen=0){
-    const buf = new ArrayBuffer(16);
-    const dv = new DataView(buf);
-    dv.setUint16(0, cmd);
-    dv.setUint16(14, outLen + inLen);
-    return buf;
-}
-
-async function execSimple(cmd){
-    const packet = buildCmd(cmd);
-    await device.transferOut(EP_OUT, packet);
-    const resp = await device.transferIn(EP_IN, 8);
-    const status = resp.data.getUint16(0);
-    if(status !== 0x0606)
-        throw "Command failed: " + status.toString(16);
-}
-
-async function scan(){
-    try {
-        log("Starting scan...");
-
-        // ---- XML StartJob ----
-        const xml1 =
-    `<?xml version="1.0" encoding="utf-8" ?>
-    <cmd xmlns:ivec="http://www.canon.com/ns/cmd/2008/07/common/">
-    <ivec:contents>
-    <ivec:operation>StartJob</ivec:operation>
-    <ivec:param_set servicetype="scan">
-    <ivec:jobID>00000001</ivec:jobID>
-    <ivec:bidi>1</ivec:bidi>
-    </ivec:param_set>
-    </ivec:contents>
-    </cmd>`;
-
-        await device.transferOut(EP_OUT, new TextEncoder().encode(xml1));
-        await device.transferIn(EP_IN, 2048);
-
-        log("XML StartJob OK");
-
-        // ---- Start Session ----
-        await execSimple(0xDB20);
-        log("Session started");
-
-        // ---- Set Scan Param (75 DPI small area) ----
-        const dpi = 75;
-        const width = 600;
-        const height = 400;
-
-        const param = new Uint8Array(0x38);
-        param[0]=1; param[1]=1; param[2]=1;
-        param[5]=1;
-
-        const dv = new DataView(param.buffer);
-        dv.setUint16(0x08, dpi | 0x8000);
-        dv.setUint16(0x0A, dpi | 0x8000);
-        dv.setUint32(0x14, width);
-        dv.setUint32(0x18, height);
-
-        param[0x1C] = 0x08;
-        param[0x1D] = 24;
-
-        let cmdBuf = buildCmd(0xD820, param.length, 0);
-        let full = new Uint8Array(16 + param.length);
-        full.set(new Uint8Array(cmdBuf),0);
-        full.set(param,16);
-
-        await device.transferOut(EP_OUT, full);
-        await device.transferIn(EP_IN, 8);
-
-        log("Scan param set");
-
-        // ---- Start Scan ----
-        await execSimple(0xD920);
-        log("Scan started");
-
-        // Wait 3 seconds for calibration
-        await new Promise(r=>setTimeout(r,3000));
-
-        // ---- Read Image Block ----
-        const readCmd = buildCmd(0xD420);
-        await device.transferOut(EP_OUT, readCmd);
-
-        const first = await device.transferIn(EP_IN, 512);
-
-        const size = first.data.getUint32(12);
-        log("Block size: " + size);
-
-        let imgData = new Uint8Array(size);
-
-        let offset = 0;
-        while(offset < size){
-            const chunk = await device.transferIn(EP_IN, Math.min(16384, size-offset));
-            imgData.set(new Uint8Array(chunk.data.buffer), offset);
-            offset += chunk.data.byteLength;
-        }
-
-        log("Image received: " + imgData.length + " bytes");
-
-        // ---- Display on Canvas ----
-        const canvas = document.getElementById("preview");
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext("2d");
-
-        const imageData = ctx.createImageData(width, height);
-
-        for(let i=0,j=0;i<imgData.length;i+=3,j+=4){
-            imageData.data[j]   = imgData[i];
-            imageData.data[j+1] = imgData[i+1];
-            imageData.data[j+2] = imgData[i+2];
-            imageData.data[j+3] = 255;
-        }
-
-        ctx.putImageData(imageData,0,0);
-
-        log("Preview rendered.");
-    }catch(e) {
-        console.log(e);
-    }finally {
-        await disconnect();
-    }
-    
-}
-
-async function disconnect(){
+async function disconnect() {
     if (!device) return;
 
     try {
         await device.releaseInterface(IFACE_NUMBER);
-    } catch(e){}
+    } catch (e) {}
 
     try {
         await device.close();
-    } catch(e){}
+    } catch (e) {}
 
     device = null;
-
+    EP_IN = null;
+    EP_OUT = null;
+    IFACE_NUMBER = null;
+    updateStatus(false);
     log("Disconnected.");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Low-level USB I/O
+// ═══════════════════════════════════════════════════════════════════════════
+async function usbWrite(data) {
+    await device.transferOut(EP_OUT, data);
+}
+
+async function usbRead(size, timeout = 5000) {
+    const result = await device.transferIn(EP_IN, size);
+    return new Uint8Array(result.data.buffer);
+}
+
+async function flushBulk() {
+    for (let i = 0; i < 8; i++) {
+        try {
+            await Promise.race([
+                device.transferIn(EP_IN, 512),
+                sleep(100).then(() => { throw new Error('timeout'); })
+            ]);
+        } catch (e) {
+            break;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  XML Dialog Layer
+// ═══════════════════════════════════════════════════════════════════════════
+async function xmlDialog(xmlStr) {
+    const payload = new TextEncoder().encode(xmlStr);
+    const opMatch = xmlStr.match(/<ivec:operation>(\w+)<\/ivec:operation>/);
+    const opName = opMatch ? opMatch[1] : 'Unknown';
+
+    await usbWrite(payload);
+
+    // Read response with retry
+    let resp = null;
+    for (let attempt = 0; attempt < 8; attempt++) {
+        try {
+            resp = await usbRead(4096);
+            break;
+        } catch (e) {
+            log(`  XML ${opName}: retry ${attempt + 1}/8`);
+            await sleep(1500);
+        }
+    }
+
+    if (!resp) {
+        log(`  XML ${opName}: TIMEOUT`);
+        return { ok: false, detail: 'Timeout' };
+    }
+
+    const respText = new TextDecoder().decode(resp);
+    const ok = /<ivec:response[^>]*>\s*OK\s*<\/ivec:response>/i.test(respText);
+    
+    const detailMatch = respText.match(/<ivec:response_detail[^>]*>\s*(.*?)\s*<\/ivec:response_detail>/s);
+    const detail = detailMatch ? detailMatch[1].trim() : '';
+
+    log(`  XML ${opName}: ${ok ? 'OK' : 'FAIL'}${detail ? ` (${detail})` : ''}`);
+    
+    return { ok, detail };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Binary Command Helpers
+// ═══════════════════════════════════════════════════════════════════════════
+function buildCmdPacket(cmdCode, dataOut = null, dataInLen = 0) {
+    const doutLen = dataOut ? dataOut.length : 0;
+    const pkt = new Uint8Array(CMD_HEADER_LEN + doutLen);
+    const dv = new DataView(pkt.buffer);
+    
+    dv.setUint16(0, cmdCode, false); // big-endian
+    dv.setUint16(14, doutLen + dataInLen, false); // big-endian
+    
+    if (dataOut && doutLen > 0) {
+        pkt.set(dataOut, CMD_HEADER_LEN);
+        // Calculate checksum for data area (excluding last byte)
+        pkt[pkt.length - 1] = makeChecksum(pkt.slice(CMD_HEADER_LEN, -1));
+    }
+    
+    return pkt;
+}
+
+async function execCmd(cmdCode, dataOut = null, dataInLen = 0) {
+    const pkt = buildCmdPacket(cmdCode, dataOut, dataInLen);
+    await usbWrite(pkt);
+    
+    const expectLen = RES_HEADER_LEN + dataInLen;
+    const resp = await usbRead(expectLen);
+    
+    if (resp.length < 2) {
+        throw new Error("Empty response from scanner");
+    }
+    
+    const status = (resp[0] << 8) | resp[1];
+    
+    if (status === STATUS_BUSY) {
+        throw new Error("BUSY");
+    }
+    if (status === STATUS_FAILED) {
+        throw new Error(`Command 0x${cmdCode.toString(16)} failed`);
+    }
+    if (status !== STATUS_OK) {
+        throw new Error(`Unexpected status 0x${status.toString(16)}`);
+    }
+    
+    if (dataInLen > 0 && resp.length > RES_HEADER_LEN) {
+        return resp.slice(RES_HEADER_LEN);
+    }
+    return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Protocol Commands
+// ═══════════════════════════════════════════════════════════════════════════
+async function startSession() {
+    await execCmd(CMD_START_SESSION);
+}
+
+async function abortSession() {
+    try {
+        await execCmd(CMD_ABORT_SESSION);
+    } catch (e) {}
+}
+
+async function sendGamma(gamma = 1.0) {
+    const lut = buildGammaTable(gamma, 1024);
+    const data = new Uint8Array(1024 * 2 + 8);
+    data[0] = 0x10;
+    data[2] = 0x08;
+    data[3] = 0x04;
+    data.set(lut, 4);
+    await execCmd(CMD_GAMMA, data);
+}
+
+async function sendScanParam(xdpi, ydpi, x, y, w, h, channels = 3, depth = 8, calibrate = true) {
+    const d = new Uint8Array(0x38);
+    const dv = new DataView(d.buffer);
+    
+    d[0x00] = 0x01;  // flatbed
+    d[0x01] = 0x01;
+    d[0x02] = 0x01;
+    d[0x05] = calibrate ? 0x01 : 0x00;
+    
+    dv.setUint16(0x08, xdpi | 0x8000, false);
+    dv.setUint16(0x0A, ydpi | 0x8000, false);
+    dv.setUint32(0x0C, x, false);
+    dv.setUint32(0x10, y, false);
+    dv.setUint32(0x14, w, false);
+    dv.setUint32(0x18, h, false);
+    
+    d[0x1C] = channels === 3 ? 0x08 : 0x04;
+    d[0x1D] = depth * channels;
+    d[0x1F] = 0x01;
+    d[0x20] = 0xFF;
+    d[0x21] = 0x81;
+    d[0x23] = 0x02;
+    d[0x24] = 0x01;
+    d[0x30] = 0x01;
+    
+    await execCmd(CMD_SCAN_PARAM_3, d);
+}
+
+async function startScan() {
+    await execCmd(CMD_SCAN_START_3);
+}
+
+async function queryStatus() {
+    const data = await execCmd(CMD_STATUS_3, null, 8);
+    if (data && data.length >= 8) {
+        currentStatus.set(data.slice(0, 8));
+    }
+    return data;
+}
+
+function isCalibrated() {
+    const s0 = currentStatus[0];
+    return (s0 & 0x01) === 1 || (s0 & 0x02) === 2;
+}
+
+async function waitReady(timeoutSec = 120) {
+    log("  Waiting for calibration...");
+    await queryStatus();
+    
+    const startTime = Date.now();
+    while (!isCalibrated()) {
+        if ((Date.now() - startTime) / 1000 > timeoutSec) {
+            throw new Error("Scanner calibration timeout");
+        }
+        await sleep(1000);
+        await queryStatus();
+    }
+    log("  Calibration complete!");
+}
+
+async function readImageBlock() {
+    const cmd = new Uint8Array(CMD_HEADER_LEN);
+    const cmdDv = new DataView(cmd.buffer);
+    cmdDv.setUint16(0, CMD_READ_IMAGE, false);
+    
+    let req;
+    if ((lastBlock & 0x20) === 0) {
+        req = Math.floor(IMAGE_BLOCK_SIZE / 65536) * 65536 + 8;
+    } else {
+        req = 32 + 8;
+    }
+    cmdDv.setUint32(12, req, false);
+    
+    await usbWrite(cmd);
+    
+    // Read first chunk (status header + start of data)
+    const first = await usbRead(512);
+    const hlen = 16;
+    
+    if (first.length < hlen) {
+        lastBlock = 0x28;
+        return { flags: 0x28, data: new Uint8Array(0) };
+    }
+    
+    const status = (first[0] << 8) | first[1];
+    const flags = first[8] & 0x38;
+    const blkSz = (first[12] << 24) | (first[13] << 16) | (first[14] << 8) | first[15];
+    lastBlock = flags;
+    
+    if (status !== STATUS_OK) {
+        throw new Error(`read_image_block status 0x${status.toString(16)}`);
+    }
+    
+    if (blkSz === 0) {
+        return { flags, data: new Uint8Array(0) };
+    }
+    
+    // Gather payload
+    const buf = [first.slice(hlen)];
+    let received = first.length - hlen;
+    
+    while (received < blkSz) {
+        try {
+            const chunk = await usbRead(Math.min(blkSz - received, IMAGE_BLOCK_SIZE));
+            buf.push(chunk);
+            received += chunk.length;
+            if (chunk.length === 0) break;
+        } catch (e) {
+            break;
+        }
+    }
+    
+    // Concatenate all chunks
+    const totalLen = buf.reduce((sum, arr) => sum + arr.length, 0);
+    const result = new Uint8Array(Math.min(totalLen, blkSz));
+    let offset = 0;
+    for (const chunk of buf) {
+        const copyLen = Math.min(chunk.length, result.length - offset);
+        result.set(chunk.slice(0, copyLen), offset);
+        offset += copyLen;
+        if (offset >= result.length) break;
+    }
+    
+    return { flags, data: result };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Main Scan Function
+// ═══════════════════════════════════════════════════════════════════════════
+async function scan() {
+    if (!device) {
+        log("Error: Not connected");
+        return;
+    }
+    
+    const btnScan = document.getElementById("btnScan");
+    btnScan.disabled = true;
+    btnScan.textContent = "Scanning...";
+    
+    const dpi = parseInt(document.getElementById("dpiSelect").value);
+    const mode = document.getElementById("modeSelect").value;
+    const channels = mode === 'color' ? 3 : 1;
+    const depth = 8;
+    
+    // Scale factor for DPI below scanner minimum
+    const scale = dpi < LIDE300_MIN_XDPI ? Math.max(1, Math.floor(LIDE300_MIN_XDPI / dpi)) : 1;
+    const hwDpi = dpi * scale;
+    
+    // Output image dimensions
+    const outW = Math.floor(LIDE300_WIDTH_75DPI * dpi / 75);
+    const outH = Math.floor(LIDE300_HEIGHT_75DPI * dpi / 75);
+    
+    // Scanner-side dimensions
+    const xs = 0;
+    const wx = alignUp(outW * scale + xs, 32);
+    const scanH = Math.min(outH * scale, Math.floor(LIDE300_HEIGHT_75DPI * hwDpi / 75));
+    
+    const rawLine = wx * channels * (depth / 8);
+    const outLine = outW * channels * (depth / 8);
+    
+    log("═".repeat(50));
+    log(`DPI: ${dpi} (hardware: ${hwDpi}, scale: ${scale})`);
+    log(`Mode: ${mode} (${channels}ch × ${depth}bit)`);
+    log(`Output size: ${outW} × ${outH} px`);
+    log("═".repeat(50));
+    
+    try {
+        // Phase 1: XML handshake
+        log("[1/10] XML StartJob...");
+        const retryDetails = ['poweroninitializing', 'devicebusy', 'busy'];
+        
+        for (let attempt = 0; attempt < 30; attempt++) {
+            const result = await xmlDialog(XML_START_1);
+            if (result.ok) break;
+            
+            if (retryDetails.includes(result.detail.toLowerCase())) {
+                log(`  Scanner not ready (${result.detail}), waiting 2s... (${attempt + 1}/30)`);
+                await sleep(2000);
+            } else {
+                throw new Error(`XML StartJob rejected: ${result.detail}`);
+            }
+            
+            if (attempt === 29) {
+                throw new Error("Scanner did not become ready after 60s");
+            }
+        }
+        
+        log("[2/10] XML VendorCmd ModeShift...");
+        const modeShiftResult = await xmlDialog(XML_START_2);
+        if (!modeShiftResult.ok) {
+            throw new Error(`XML ModeShift rejected: ${modeShiftResult.detail}`);
+        }
+        
+        // Phase 2: Clear pending data
+        log("[3/10] Clearing buffers...");
+        await flushBulk();
+        
+        // Phase 3: Open session (retry on busy)
+        log("[4/10] Starting session...");
+        for (let attempt = 0; attempt < 10; attempt++) {
+            try {
+                await startSession();
+                break;
+            } catch (e) {
+                if (e.message === "BUSY" && attempt < 9) {
+                    log(`  busy - retry ${attempt + 2}/10`);
+                    await sleep(1000);
+                } else {
+                    throw new Error("Scanner stayed busy");
+                }
+            }
+        }
+        
+        // Phase 4: Gamma tables (×3 for gen 3+)
+        log("[5/10] Sending gamma tables ×3...");
+        for (let i = 0; i < 3; i++) {
+            await sendGamma(1.0);
+        }
+        
+        // Phase 5: Scan parameters
+        log("[6/10] Sending scan parameters...");
+        await sendScanParam(hwDpi, hwDpi, 0, 0, wx, scanH, channels, depth, true);
+        
+        // Phase 6: Trigger scan
+        log("[7/10] Starting scan...");
+        await startScan();
+        
+        // Phase 7: Wait for calibration
+        log("[8/10] Calibrating...");
+        await waitReady();
+        await sleep(1000);
+        
+        // Phase 8: Read image blocks
+        log("[9/10] Reading image data...");
+        lastBlock = 0;
+        const rawChunks = [];
+        let blkN = 0;
+        let totalBytes = 0;
+        const startTime = Date.now();
+        
+        while ((lastBlock & 0x28) !== 0x28) {
+            const { flags, data } = await readImageBlock();
+            blkN++;
+            
+            if (data.length > 0) {
+                rawChunks.push(data);
+                totalBytes += data.length;
+            } else {
+                await sleep(10);
+            }
+            
+            if (blkN % 20 === 0) {
+                const elapsed = (Date.now() - startTime) / 1000;
+                const mb = totalBytes / 1048576;
+                log(`  block ${blkN}: ${mb.toFixed(1)} MB (${(mb / elapsed).toFixed(1)} MB/s) flags=0x${flags.toString(16)}`);
+            }
+        }
+        
+        const elapsed = (Date.now() - startTime) / 1000;
+        log(`  Done: ${totalBytes} bytes in ${blkN} blocks (${elapsed.toFixed(1)}s)`);
+        
+        // Phase 9: Clean up session
+        log("[10/10] Ending session...");
+        await abortSession();
+        await xmlDialog(XML_END);
+        
+        // Post-process & display
+        if (totalBytes === 0) {
+            log("WARNING: No image data received!");
+            return;
+        }
+        
+        // Concatenate raw data
+        const raw = new Uint8Array(totalBytes);
+        let rawOffset = 0;
+        for (const chunk of rawChunks) {
+            raw.set(chunk, rawOffset);
+            rawOffset += chunk.length;
+        }
+        
+        const totalRawLines = Math.floor(raw.length / rawLine);
+        const actualH = Math.min(Math.floor(totalRawLines / scale), outH);
+        log(`Raw lines: ${totalRawLines} → output: ${outW}×${actualH}`);
+        
+        // Create output image
+        const img = new Uint8Array(actualH * outLine);
+        
+        if (scale <= 1) {
+            for (let y = 0; y < actualH; y++) {
+                const src = y * rawLine;
+                img.set(raw.slice(src, src + outLine), y * outLine);
+            }
+        } else {
+            // Downsample by averaging
+            const bpc = channels;
+            for (let y = 0; y < actualH; y++) {
+                for (let px = 0; px < outW; px++) {
+                    for (let ch = 0; ch < channels; ch++) {
+                        let total = 0;
+                        let cnt = 0;
+                        for (let sy = 0; sy < scale; sy++) {
+                            for (let sx = 0; sx < scale; sx++) {
+                                const ry = y * scale + sy;
+                                const rx = px * scale + sx;
+                                if (ry < totalRawLines && rx < wx) {
+                                    const off = ry * rawLine + rx * bpc + ch;
+                                    if (off < raw.length) {
+                                        total += raw[off];
+                                        cnt++;
+                                    }
+                                }
+                            }
+                        }
+                        img[y * outLine + px * bpc + ch] = Math.floor(total / Math.max(cnt, 1));
+                    }
+                }
+            }
+        }
+        
+        // Display on canvas
+        const canvas = document.getElementById("preview");
+        canvas.width = outW;
+        canvas.height = actualH;
+        const ctx = canvas.getContext("2d");
+        const imageData = ctx.createImageData(outW, actualH);
+        
+        for (let y = 0; y < actualH; y++) {
+            for (let x = 0; x < outW; x++) {
+                const srcIdx = y * outLine + x * channels;
+                const dstIdx = (y * outW + x) * 4;
+                
+                if (channels === 3) {
+                    imageData.data[dstIdx] = img[srcIdx];       // R
+                    imageData.data[dstIdx + 1] = img[srcIdx + 1]; // G
+                    imageData.data[dstIdx + 2] = img[srcIdx + 2]; // B
+                } else {
+                    imageData.data[dstIdx] = img[srcIdx];       // R
+                    imageData.data[dstIdx + 1] = img[srcIdx];   // G
+                    imageData.data[dstIdx + 2] = img[srcIdx];   // B
+                }
+                imageData.data[dstIdx + 3] = 255; // A
+            }
+        }
+        
+        ctx.putImageData(imageData, 0, 0);
+        log("Scan complete! Preview rendered.");
+        
+    } catch (e) {
+        log(`Scan error: ${e.message}`);
+        console.error(e);
+        try { await abortSession(); } catch (e2) {}
+        try { await xmlDialog(XML_END); } catch (e2) {}
+    } finally {
+        btnScan.disabled = false;
+        btnScan.textContent = "Start Scan";
+    }
 }
 </script>
 

@@ -117,6 +117,7 @@ const XML_END =
 let device = null;
 let EP_OUT = null;
 let EP_IN = null;
+let EP_INT = null;  // Interrupt endpoint
 let IFACE_NUMBER = null;
 let currentStatus = new Uint8Array(16);
 let lastBlock = 0;
@@ -200,33 +201,58 @@ async function connect() {
         if (device.configuration === null) {
             await device.selectConfiguration(1);
         }
+        
+        // Log all interfaces and endpoints for debugging
+        log("Device configuration:");
+        for (const iface of device.configuration.interfaces) {
+            for (const alt of iface.alternates) {
+                log(`  Interface ${iface.interfaceNumber} alt=${alt.alternateSetting} class=0x${alt.interfaceClass.toString(16)}`);
+                for (const ep of alt.endpoints) {
+                    log(`    EP ${ep.endpointNumber} ${ep.direction} ${ep.type} maxPacket=${ep.packetSize}`);
+                }
+            }
+        }
 
         // Find interface with bulk IN + bulk OUT endpoints
         for (const iface of device.configuration.interfaces) {
             for (const alt of iface.alternates) {
                 let bulkIn = null;
                 let bulkOut = null;
+                let intIn = null;
 
                 for (const ep of alt.endpoints) {
                     if (ep.type === "bulk") {
                         if (ep.direction === "in") bulkIn = ep.endpointNumber;
                         if (ep.direction === "out") bulkOut = ep.endpointNumber;
                     }
+                    if (ep.type === "interrupt" && ep.direction === "in") {
+                        intIn = ep.endpointNumber;
+                    }
                 }
 
                 if (bulkIn !== null && bulkOut !== null) {
                     IFACE_NUMBER = iface.interfaceNumber;
+                    
+                    log(`Claiming interface ${IFACE_NUMBER}...`);
                     await device.claimInterface(IFACE_NUMBER);
                     
+                    // Only select alternate interface if it's not 0
                     if (alt.alternateSetting !== 0) {
+                        log(`Selecting alternate interface ${alt.alternateSetting}...`);
                         await device.selectAlternateInterface(IFACE_NUMBER, alt.alternateSetting);
                     }
 
                     EP_IN = bulkIn;
                     EP_OUT = bulkOut;
+                    EP_INT = intIn;
 
-                    log(`Interface: ${IFACE_NUMBER}, Bulk IN: ${EP_IN}, Bulk OUT: ${EP_OUT}`);
+                    log(`Using: Interface ${IFACE_NUMBER}, Bulk OUT: ${EP_OUT}, Bulk IN: ${EP_IN}, Int IN: ${EP_INT}`);
                     updateStatus(true);
+                    
+                    // Clear interrupt endpoint first
+                    if (EP_INT) {
+                        await clearInterrupts();
+                    }
                     
                     // Flush any stale data
                     await flushBulk();
@@ -239,6 +265,7 @@ async function connect() {
         throw new Error("No bulk interface found!");
     } catch (e) {
         log(`Connection error: ${e.message}`);
+        console.error(e);
         device = null;
         updateStatus(false);
     }
@@ -258,6 +285,7 @@ async function disconnect() {
     device = null;
     EP_IN = null;
     EP_OUT = null;
+    EP_INT = null;
     IFACE_NUMBER = null;
     updateStatus(false);
     log("Disconnected.");
@@ -267,22 +295,103 @@ async function disconnect() {
 //  Low-level USB I/O
 // ═══════════════════════════════════════════════════════════════════════════
 async function usbWrite(data) {
-    await device.transferOut(EP_OUT, data);
+    log(`  -> USB OUT: ${data.length} bytes`);
+    const result = await device.transferOut(EP_OUT, data);
+    log(`  <- USB OUT status: ${result.status}`);
+    if (result.status !== 'ok') {
+        throw new Error(`USB write failed: ${result.status}`);
+    }
 }
 
-async function usbRead(size, timeout = 5000) {
+async function usbRead(size) {
+    log(`  -> USB IN: requesting ${size} bytes...`);
+    
+    // Add timeout to prevent hanging forever
+    const timeoutMs = 10000;
+    const timeoutPromise = sleep(timeoutMs).then(() => {
+        throw new Error(`USB read timeout after ${timeoutMs}ms`);
+    });
+    
+    const result = await Promise.race([
+        device.transferIn(EP_IN, size),
+        timeoutPromise
+    ]);
+    
+    log(`  <- USB IN status: ${result.status}, received: ${result.data ? result.data.byteLength : 0} bytes`);
+    if (result.status !== 'ok') {
+        throw new Error(`USB read failed: ${result.status}`);
+    }
+    if (!result.data || result.data.byteLength === 0) {
+        return new Uint8Array(0);
+    }
+    return new Uint8Array(result.data.buffer, result.data.byteOffset, result.data.byteLength);
+}
+
+async function usbReadWithTimeout(size, timeoutMs = 5000) {
+    const timeoutPromise = sleep(timeoutMs).then(() => ({ status: 'timeout', data: null }));
+    
+    const result = await Promise.race([
+        device.transferIn(EP_IN, size),
+        timeoutPromise
+    ]);
+    
+    if (result.status === 'timeout') {
+        return { timeout: true, data: new Uint8Array(0) };
+    }
+    
+    if (result.status !== 'ok' || !result.data) {
+        return { timeout: false, data: new Uint8Array(0) };
+    }
+    
+    return { 
+        timeout: false, 
+        data: new Uint8Array(result.data.buffer, result.data.byteOffset, result.data.byteLength) 
+    };
+}
+
+async function usbReadQuiet(size) {
     const result = await device.transferIn(EP_IN, size);
-    return new Uint8Array(result.data.buffer);
+    if (result.status !== 'ok' || !result.data) {
+        return new Uint8Array(0);
+    }
+    return new Uint8Array(result.data.buffer, result.data.byteOffset, result.data.byteLength);
 }
 
 async function flushBulk() {
+    log("  Flushing stale bulk data...");
     for (let i = 0; i < 8; i++) {
         try {
-            await Promise.race([
+            const result = await Promise.race([
                 device.transferIn(EP_IN, 512),
-                sleep(100).then(() => { throw new Error('timeout'); })
+                sleep(200).then(() => ({ status: 'timeout' }))
             ]);
+            if (result.status === 'timeout') {
+                log(`  Flush: no more data`);
+                break;
+            }
+            log(`  Flush: cleared ${result.data?.byteLength || 0} bytes`);
         } catch (e) {
+            log(`  Flush: done (${e.message})`);
+            break;
+        }
+    }
+}
+
+async function clearInterrupts() {
+    log("  Clearing interrupt endpoint...");
+    for (let i = 0; i < 16; i++) {
+        try {
+            const result = await Promise.race([
+                device.transferIn(EP_INT, 64),
+                sleep(100).then(() => ({ status: 'timeout' }))
+            ]);
+            if (result.status === 'timeout') {
+                log(`  Interrupts: cleared`);
+                break;
+            }
+            log(`  Interrupt: got ${result.data?.byteLength || 0} bytes`);
+        } catch (e) {
+            log(`  Interrupts: done (${e.message})`);
             break;
         }
     }
@@ -296,26 +405,62 @@ async function xmlDialog(xmlStr) {
     const opMatch = xmlStr.match(/<ivec:operation>(\w+)<\/ivec:operation>/);
     const opName = opMatch ? opMatch[1] : 'Unknown';
 
-    await usbWrite(payload);
+    log(`  XML ${opName}: sending ${payload.length} bytes...`);
+    
+    try {
+        await usbWrite(payload);
+    } catch (e) {
+        log(`  XML ${opName}: write error - ${e.message}`);
+        return { ok: false, detail: `Write error: ${e.message}` };
+    }
 
-    // Read response with retry
+    // Read response with retry - use smaller buffer and timeout
     let resp = null;
     for (let attempt = 0; attempt < 8; attempt++) {
         try {
-            resp = await usbRead(4096);
-            break;
+            log(`  XML ${opName}: reading response (attempt ${attempt + 1}/8)...`);
+            
+            // Try reading with a smaller buffer first (512 bytes)
+            const result = await usbReadWithTimeout(512, 3000);
+            
+            if (result.timeout) {
+                log(`  XML ${opName}: read timeout, retrying...`);
+                continue;
+            }
+            
+            if (result.data.length > 0) {
+                resp = result.data;
+                
+                // If we got exactly 512 bytes, there might be more
+                if (resp.length === 512) {
+                    log(`  XML ${opName}: got 512 bytes, checking for more...`);
+                    const more = await usbReadWithTimeout(4096, 500);
+                    if (!more.timeout && more.data.length > 0) {
+                        const combined = new Uint8Array(resp.length + more.data.length);
+                        combined.set(resp);
+                        combined.set(more.data, resp.length);
+                        resp = combined;
+                    }
+                }
+                break;
+            }
+            
+            log(`  XML ${opName}: empty response, retrying...`);
+            await sleep(1000);
         } catch (e) {
-            log(`  XML ${opName}: retry ${attempt + 1}/8`);
-            await sleep(1500);
+            log(`  XML ${opName}: read error - ${e.message}, retrying...`);
+            await sleep(1000);
         }
     }
 
-    if (!resp) {
-        log(`  XML ${opName}: TIMEOUT`);
+    if (!resp || resp.length === 0) {
+        log(`  XML ${opName}: TIMEOUT - no response after 8 attempts`);
         return { ok: false, detail: 'Timeout' };
     }
 
     const respText = new TextDecoder().decode(resp);
+    log(`  XML ${opName}: response (${resp.length} bytes): ${respText.substring(0, 300)}...`);
+    
     const ok = /<ivec:response[^>]*>\s*OK\s*<\/ivec:response>/i.test(respText);
     
     const detailMatch = respText.match(/<ivec:response_detail[^>]*>\s*(.*?)\s*<\/ivec:response_detail>/s);
@@ -323,7 +468,7 @@ async function xmlDialog(xmlStr) {
 
     log(`  XML ${opName}: ${ok ? 'OK' : 'FAIL'}${detail ? ` (${detail})` : ''}`);
     
-    return { ok, detail };
+    return { ok, detail, response: respText };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>LiDE300 WebUSB 50DPI Test</title>
+<style>
+body { font-family: sans-serif; }
+button { margin: 5px; padding: 8px; }
+canvas { border: 1px solid #999; margin-top: 10px; }
+#log { white-space: pre-wrap; font-size: 12px; background:#f5f5f5; padding:10px; height:200px; overflow:auto;}
+</style>
+</head>
+<body>
+
+<h2>Canon LiDE300 WebUSB 50 DPI Test</h2>
+
+<button onclick="connect()">Connect</button>
+<button onclick="scan()">Scan (≈50 DPI)</button>
+<button onclick="disconnect()">Disconnect</button>
+
+<br>
+<canvas id="preview"></canvas>
+
+<h3>Log</h3>
+<div id="log"></div>
+
+<script>
+const VID = 0x04A9;
+const PID = 0x1913;
+
+let EP_OUT;
+let EP_IN;
+let IFACE_NUMBER;
+
+let device = null;
+
+function log(msg){
+    console.log(msg);
+    document.getElementById("log").textContent += msg + "\n";
+}
+
+
+
+async function connect(){
+
+    device = await navigator.usb.requestDevice({
+        filters: [{vendorId: 0x04A9, productId: 0x1913}]
+    });
+
+    await device.open();
+
+    if (device.configuration === null)
+        await device.selectConfiguration(1);
+
+    // 🔎 查找包含 bulk IN + bulk OUT 的 interface
+    for (const iface of device.configuration.interfaces) {
+
+        for (const alt of iface.alternates) {
+
+            let bulkIn = null;
+            let bulkOut = null;
+
+            for (const ep of alt.endpoints) {
+                if (ep.type === "bulk") {
+                    if (ep.direction === "in")  bulkIn = ep.endpointNumber;
+                    if (ep.direction === "out") bulkOut = ep.endpointNumber;
+                }
+            }
+
+            if (bulkIn !== null && bulkOut !== null) {
+
+                IFACE_NUMBER = iface.interfaceNumber;
+
+                await device.claimInterface(IFACE_NUMBER);
+                await device.selectAlternateInterface(IFACE_NUMBER, alt.alternateSetting);
+
+                EP_IN  = bulkIn;
+                EP_OUT = bulkOut;
+
+                log("Using interface: " + IFACE_NUMBER);
+                log("Bulk IN: " + EP_IN);
+                log("Bulk OUT: " + EP_OUT);
+
+                return;
+            }
+        }
+    }
+
+    throw "No bulk interface found!";
+}
+
+function buildCmd(cmd, outLen=0, inLen=0){
+    const buf = new ArrayBuffer(16);
+    const dv = new DataView(buf);
+    dv.setUint16(0, cmd);
+    dv.setUint16(14, outLen + inLen);
+    return buf;
+}
+
+async function execSimple(cmd){
+    const packet = buildCmd(cmd);
+    await device.transferOut(EP_OUT, packet);
+    const resp = await device.transferIn(EP_IN, 8);
+    const status = resp.data.getUint16(0);
+    if(status !== 0x0606)
+        throw "Command failed: " + status.toString(16);
+}
+
+async function scan(){
+    try {
+        log("Starting scan...");
+
+        // ---- XML StartJob ----
+        const xml1 =
+    `<?xml version="1.0" encoding="utf-8" ?>
+    <cmd xmlns:ivec="http://www.canon.com/ns/cmd/2008/07/common/">
+    <ivec:contents>
+    <ivec:operation>StartJob</ivec:operation>
+    <ivec:param_set servicetype="scan">
+    <ivec:jobID>00000001</ivec:jobID>
+    <ivec:bidi>1</ivec:bidi>
+    </ivec:param_set>
+    </ivec:contents>
+    </cmd>`;
+
+        await device.transferOut(EP_OUT, new TextEncoder().encode(xml1));
+        await device.transferIn(EP_IN, 2048);
+
+        log("XML StartJob OK");
+
+        // ---- Start Session ----
+        await execSimple(0xDB20);
+        log("Session started");
+
+        // ---- Set Scan Param (75 DPI small area) ----
+        const dpi = 75;
+        const width = 600;
+        const height = 400;
+
+        const param = new Uint8Array(0x38);
+        param[0]=1; param[1]=1; param[2]=1;
+        param[5]=1;
+
+        const dv = new DataView(param.buffer);
+        dv.setUint16(0x08, dpi | 0x8000);
+        dv.setUint16(0x0A, dpi | 0x8000);
+        dv.setUint32(0x14, width);
+        dv.setUint32(0x18, height);
+
+        param[0x1C] = 0x08;
+        param[0x1D] = 24;
+
+        let cmdBuf = buildCmd(0xD820, param.length, 0);
+        let full = new Uint8Array(16 + param.length);
+        full.set(new Uint8Array(cmdBuf),0);
+        full.set(param,16);
+
+        await device.transferOut(EP_OUT, full);
+        await device.transferIn(EP_IN, 8);
+
+        log("Scan param set");
+
+        // ---- Start Scan ----
+        await execSimple(0xD920);
+        log("Scan started");
+
+        // Wait 3 seconds for calibration
+        await new Promise(r=>setTimeout(r,3000));
+
+        // ---- Read Image Block ----
+        const readCmd = buildCmd(0xD420);
+        await device.transferOut(EP_OUT, readCmd);
+
+        const first = await device.transferIn(EP_IN, 512);
+
+        const size = first.data.getUint32(12);
+        log("Block size: " + size);
+
+        let imgData = new Uint8Array(size);
+
+        let offset = 0;
+        while(offset < size){
+            const chunk = await device.transferIn(EP_IN, Math.min(16384, size-offset));
+            imgData.set(new Uint8Array(chunk.data.buffer), offset);
+            offset += chunk.data.byteLength;
+        }
+
+        log("Image received: " + imgData.length + " bytes");
+
+        // ---- Display on Canvas ----
+        const canvas = document.getElementById("preview");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+
+        const imageData = ctx.createImageData(width, height);
+
+        for(let i=0,j=0;i<imgData.length;i+=3,j+=4){
+            imageData.data[j]   = imgData[i];
+            imageData.data[j+1] = imgData[i+1];
+            imageData.data[j+2] = imgData[i+2];
+            imageData.data[j+3] = 255;
+        }
+
+        ctx.putImageData(imageData,0,0);
+
+        log("Preview rendered.");
+    }catch(e) {
+        console.log(e);
+    }finally {
+        await disconnect();
+    }
+    
+}
+
+async function disconnect(){
+    if (!device) return;
+
+    try {
+        await device.releaseInterface(IFACE_NUMBER);
+    } catch(e){}
+
+    try {
+        await device.close();
+    } catch(e){}
+
+    device = null;
+
+    log("Disconnected.");
+}
+</script>
+
+</body>
+</html>
